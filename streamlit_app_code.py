@@ -1,8 +1,15 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
-import mysql.connector
 from datetime import datetime
 import os
+
+# Try importing mysql connector
+try:
+    import mysql.connector
+except ImportError:
+    st.error("MySQL connector not installed. Install with: pip install mysql-connector-python")
+    st.stop()
 
 # Page configuration
 st.set_page_config(
@@ -61,57 +68,6 @@ st.markdown("""
         color: #6b7280;
         margin-top: 0.25rem;
     }
-    .status-badge {
-        padding: 0.25rem 0.75rem;
-        border-radius: 9999px;
-        font-size: 0.75rem;
-        font-weight: 500;
-        display: inline-block;
-    }
-    .status-open {
-        background-color: #fef3c7;
-        color: #92400e;
-    }
-    .status-investigation {
-        background-color: #fee2e2;
-        color: #991b1b;
-        font-weight: 600;
-    }
-    .status-settled {
-        background-color: #d1fae5;
-        color: #065f46;
-    }
-    .status-denied {
-        background-color: #f3f4f6;
-        color: #374151;
-    }
-    .fraud-high {
-        background-color: #fee2e2;
-        color: #991b1b;
-        font-weight: 600;
-    }
-    .fraud-medium {
-        color: #ea580c;
-    }
-    .high-value-tag {
-        background-color: #ede9fe;
-        color: #6b21a8;
-        font-size: 0.75rem;
-        font-weight: 600;
-        padding: 0.125rem 0.5rem;
-        border-radius: 0.25rem;
-        display: inline-block;
-        margin-top: 0.25rem;
-    }
-    .short-time-tag {
-        background-color: #ddd6fe;
-        color: #5b21b6;
-        font-size: 0.75rem;
-        font-weight: 500;
-        padding: 0.125rem 0.5rem;
-        border-radius: 9999px;
-        display: inline-block;
-    }
     div[data-testid="stDataFrame"] {
         background: white;
         border-radius: 0.75rem;
@@ -150,23 +106,23 @@ def get_db_connection():
         if hasattr(st, 'secrets') and 'database' in st.secrets:
             connection = mysql.connector.connect(
                 host=st.secrets["database"]["host"],
-                port=st.secrets["database"]["port"],
+                port=int(st.secrets["database"]["port"]),
                 user=st.secrets["database"]["user"],
                 password=st.secrets["database"]["password"],
                 database=st.secrets["database"]["database"]
             )
         else:
-            # Fallback to environment variables or hardcoded (for local dev)
+            # Fallback to hardcoded (for local dev only)
             connection = mysql.connector.connect(
-                host=os.getenv("DB_HOST", "db-mysql-itom-do-user-28250611-0.j.db.ondigitalocean.com"),
-                port=int(os.getenv("DB_PORT", "25060")),
-                user=os.getenv("DB_USER", "5037_car"),
-                password=os.getenv("DB_PASSWORD", "Pass2025_5037"),
-                database=os.getenv("DB_NAME", "5037_car")
+                host="db-mysql-itom-do-user-28250611-0.j.db.ondigitalocean.com",
+                port=25060,
+                user="5037_car",
+                password="Pass2025_5037",
+                database="5037_car"
             )
         return connection
     except Exception as e:
-        st.error(f"❌ Database connection failed: {e}")
+        st.error(f"❌ Database connection failed: {str(e)}")
         return None
 
 # Query functions
@@ -183,23 +139,40 @@ def fetch_fraud_analytics():
         Fraud_Probability as fraud_prob,
         Claim_Amount_Requested as amount_requested,
         Settlement_Status as status,
-        DATEDIFF(Submission_Date, Policy.Start_Date) as days_to_claim,
         Credit_Score as credit_score,
-        Vehicle.Make as make,
+        Policy_ID as policy_id,
         Is_Fraudulent_Flag as is_fraudulent
     FROM V_FRAUD_ANALYTICS_DASHBOARD
-    LEFT JOIN Policy ON V_FRAUD_ANALYTICS_DASHBOARD.Policy_ID = Policy.Policy_ID
-    LEFT JOIN Vehicle ON Policy.VIN = Vehicle.VIN
     ORDER BY Fraud_Probability DESC
     """
     
     try:
         df = pd.read_sql(query, conn)
+        
+        # Get additional data for days_to_claim and vehicle make
+        if not df.empty:
+            detail_query = """
+            SELECT 
+                c.Claim_ID,
+                DATEDIFF(c.Submission_Date, p.Start_Date) as days_to_claim,
+                v.Make
+            FROM Claim c
+            LEFT JOIN Policy p ON c.Policy_ID = p.Policy_ID
+            LEFT JOIN Vehicle v ON p.VIN = v.VIN
+            WHERE c.Claim_ID IN ({})
+            """.format(','.join(map(str, df['id'].tolist())))
+            
+            detail_df = pd.read_sql(detail_query, conn)
+            df = df.merge(detail_df, left_on='id', right_on='Claim_ID', how='left')
+            df['days_to_claim'] = df['days_to_claim'].fillna(0)
+            df['Make'] = df['Make'].fillna('Unknown')
+        
         conn.close()
         return df
     except Exception as e:
-        st.error(f"Query error: {e}")
-        conn.close()
+        st.error(f"Query error: {str(e)}")
+        if conn:
+            conn.close()
         return pd.DataFrame()
 
 def fetch_validation_queue():
@@ -214,15 +187,16 @@ def fetch_validation_queue():
         CONCAT(ph.First_Name, ' ', ph.Last_Name) as policyholder,
         c.Claim_Amount_Requested as amount_requested,
         c.Settlement_Status as status,
-        CONCAT(a.First_Name, ' ', a.Last_Name) as last_event_agent,
-        MAX(ce.Event_Date) as last_event_time
+        COALESCE(CONCAT(a.First_Name, ' ', a.Last_Name), 'N/A') as last_event_agent,
+        COALESCE(MAX(ce.Event_Date), c.Submission_Date) as last_event_time
     FROM Claim c
     JOIN Policyholder ph ON c.Policyholder_ID = ph.Policyholder_ID
     LEFT JOIN Claim_Event ce ON c.Claim_ID = ce.Claim_ID
     LEFT JOIN Agent a ON ce.Agent_ID = a.Agent_ID
     WHERE c.Claim_Amount_Requested >= 20000 
        OR c.Settlement_Status IN ('Denied', 'Settled')
-    GROUP BY c.Claim_ID, ph.First_Name, ph.Last_Name, c.Claim_Amount_Requested, c.Settlement_Status, a.First_Name, a.Last_Name
+    GROUP BY c.Claim_ID, ph.First_Name, ph.Last_Name, c.Claim_Amount_Requested, 
+             c.Settlement_Status, a.First_Name, a.Last_Name, c.Submission_Date
     ORDER BY c.Claim_Amount_Requested DESC
     LIMIT 20
     """
@@ -232,8 +206,9 @@ def fetch_validation_queue():
         conn.close()
         return df
     except Exception as e:
-        st.error(f"Query error: {e}")
-        conn.close()
+        st.error(f"Query error: {str(e)}")
+        if conn:
+            conn.close()
         return pd.DataFrame()
 
 def fetch_agent_workload():
@@ -242,23 +217,22 @@ def fetch_agent_workload():
     if conn is None:
         return {}
     
-    query = """
-    SELECT 
-        CONCAT(a.First_Name, ' ', a.Last_Name, ' (ID ', a.Agent_ID, ')') as agent_name,
-        COUNT(ce.Event_ID) as event_count,
-        AVG(DATEDIFF(c.Settlement_Date, c.Submission_Date)) as avg_processing_days
-    FROM Agent a
-    LEFT JOIN Claim_Event ce ON a.Agent_ID = ce.Agent_ID
-    LEFT JOIN Claim c ON ce.Claim_ID = c.Claim_ID
-    GROUP BY a.Agent_ID, a.First_Name, a.Last_Name
-    ORDER BY event_count DESC
-    LIMIT 3
-    """
-    
     try:
-        df = pd.read_sql(query, conn)
+        # Top agents query
+        agent_query = """
+        SELECT 
+            CONCAT(a.First_Name, ' ', a.Last_Name, ' (ID ', a.Agent_ID, ')') as agent_name,
+            COUNT(ce.Event_ID) as event_count
+        FROM Agent a
+        LEFT JOIN Claim_Event ce ON a.Agent_ID = ce.Agent_ID
+        GROUP BY a.Agent_ID, a.First_Name, a.Last_Name
+        HAVING event_count > 0
+        ORDER BY event_count DESC
+        LIMIT 3
+        """
+        agent_df = pd.read_sql(agent_query, conn)
         
-        # Get summary stats
+        # Summary stats query
         summary_query = """
         SELECT 
             COUNT(DISTINCT c.Claim_ID) as total_claims,
@@ -271,14 +245,15 @@ def fetch_agent_workload():
         conn.close()
         
         return {
-            'top_agents': df.to_dict('records'),
+            'top_agents': agent_df.to_dict('records') if not agent_df.empty else [],
             'total_claims_managed': int(summary['total_claims'].iloc[0]) if not summary.empty else 0,
             'pending_validation': int(summary['pending_validation'].iloc[0]) if not summary.empty else 0,
-            'avg_processing_days': round(float(summary['avg_processing_days'].iloc[0]), 1) if not summary.empty else 0
+            'avg_processing_days': round(float(summary['avg_processing_days'].iloc[0]), 1) if not summary.empty and summary['avg_processing_days'].iloc[0] else 0
         }
     except Exception as e:
-        st.error(f"Query error: {e}")
-        conn.close()
+        st.error(f"Query error: {str(e)}")
+        if conn:
+            conn.close()
         return {}
 
 def fetch_executive_kpis():
@@ -303,15 +278,22 @@ def fetch_executive_kpis():
         total_settlements = float(financial['total_settlements'].iloc[0] or 0)
         loss_ratio = (total_settlements / total_premiums * 100) if total_premiums > 0 else 0
         
-        # Fraud metrics
+        # Fraud metrics from view
         fraud_query = """
         SELECT 
             COUNT(*) as total_cases,
-            SUM(CASE WHEN Is_Fraudulent_Flag = 1 THEN 1 ELSE 0 END) as confirmed_fraud,
-            SUM(CASE WHEN Settlement_Status = 'Denied' THEN 1 ELSE 0 END) as denied_claims
+            SUM(CASE WHEN Is_Fraudulent_Flag = 1 THEN 1 ELSE 0 END) as confirmed_fraud
         FROM V_FRAUD_ANALYTICS_DASHBOARD
         """
         fraud = pd.read_sql(fraud_query, conn)
+        
+        # Denied claims
+        denied_query = """
+        SELECT COUNT(*) as denied_claims 
+        FROM Claim 
+        WHERE Settlement_Status = 'Denied'
+        """
+        denied = pd.read_sql(denied_query, conn)
         
         total_cases = int(fraud['total_cases'].iloc[0] or 0)
         confirmed_fraud = int(fraud['confirmed_fraud'].iloc[0] or 0)
@@ -342,14 +324,15 @@ def fetch_executive_kpis():
             'total_settlements': total_settlements,
             'confirmed_fraud_rate': round(fraud_rate, 1),
             'total_cases_processed': total_cases,
-            'successful_fraud_interventions': int(fraud['denied_claims'].iloc[0] or 0),
-            'churn_rate': 12.5,  # Placeholder - would need churn calculation
-            'clv_increase_ytd': 7.2,  # Placeholder - would need CLV calculation
-            'top_risk_customers': risk_customers.to_dict('records')
+            'successful_fraud_interventions': int(denied['denied_claims'].iloc[0] or 0),
+            'churn_rate': 12.5,
+            'clv_increase_ytd': 7.2,
+            'top_risk_customers': risk_customers.to_dict('records') if not risk_customers.empty else []
         }
     except Exception as e:
-        st.error(f"Query error: {e}")
-        conn.close()
+        st.error(f"Query error: {str(e)}")
+        if conn:
+            conn.close()
         return {}
 
 # Metric card component
@@ -402,7 +385,7 @@ def fraud_analyst_dashboard():
     # KPI Cards
     high_priority = len(df[df['fraud_prob'] >= 0.75])
     avg_fraud_prob = df['fraud_prob'].mean() * 100
-    confirmed_fraud = df['is_fraudulent'].sum() if 'is_fraudulent' in df.columns else 0
+    confirmed_fraud = int(df['is_fraudulent'].sum()) if 'is_fraudulent' in df.columns else 0
     total_claims = len(df)
     
     col1, col2, col3, col4 = st.columns(4)
@@ -412,7 +395,7 @@ def fraud_analyst_dashboard():
     with col2:
         metric_card("Average Fraud Probability", f"{avg_fraud_prob:.1f}%", "", "orange")
     with col3:
-        metric_card("Confirmed Fraud (YTD)", str(int(confirmed_fraud)), "", "red")
+        metric_card("Confirmed Fraud (YTD)", str(confirmed_fraud), "", "red")
     with col4:
         metric_card("Total Claims in System", str(total_claims), "", "indigo")
     
@@ -442,14 +425,14 @@ def fraud_analyst_dashboard():
         
         # Highlight short policy-to-claim time
         display_df['days_flag'] = display_df['days_to_claim'].apply(
-            lambda x: f"{x} days 🟣 Short P:C" if x <= 30 else f"{x} days"
+            lambda x: f"{int(x)} days 🟣 Short P:C" if x <= 30 else f"{int(x)} days"
         )
         
         st.dataframe(
-            display_df[['id', 'policyholder_info', 'make', 'fraud_prob', 'amount_requested', 'days_flag', 'status']].rename(columns={
+            display_df[['id', 'policyholder_info', 'Make', 'fraud_prob', 'amount_requested', 'days_flag', 'status']].rename(columns={
                 'id': 'ID',
                 'policyholder_info': 'Policyholder (Credit Score)',
-                'make': 'Vehicle',
+                'Make': 'Vehicle',
                 'fraud_prob': 'Fraud Probability',
                 'amount_requested': 'Amount Requested',
                 'days_flag': 'Policy-to-Claim Time',
@@ -510,11 +493,6 @@ def claims_manager_dashboard():
     if not validation_queue.empty:
         display_df = validation_queue.copy()
         display_df['amount_requested'] = '$' + display_df['amount_requested'].apply(lambda x: f"{x:,.0f}")
-        display_df['high_value'] = display_df['amount_requested'].str.replace('$', '').str.replace(',', '').astype(float) >= 20000
-        display_df['policyholder_display'] = display_df.apply(
-            lambda row: f"{row['policyholder']}\n🟣 High-Value Review" if row['high_value'] else row['policyholder'],
-            axis=1
-        )
         
         st.dataframe(
             display_df[['id', 'policyholder', 'amount_requested', 'last_event_agent', 'last_event_time', 'status']].rename(columns={
